@@ -3,6 +3,7 @@
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QPushButton>
+#include <QtCore/QThread> // [1]
 #include "worker.h"
 
 class MainWindow : public QWidget {
@@ -30,8 +31,13 @@ public:
         mainLayout->addLayout(progressLayout);
         emit runningChanged(false);
     }
+    ~MainWindow() Q_DECL_OVERRIDE { // [6]
+        emit canceled();
+        for (auto thread : threads_) thread->wait();
+    }
 signals:
     void runningChanged(bool running);
+    void canceled();
 public slots:
     void run() {
         emit runningChanged(true);
@@ -40,16 +46,32 @@ public slots:
         for (int i = 0; i < 10; ++i) {
             auto bar = bars_[i];
             bar->setValue(0);
-            Worker worker;
-            connect(&worker, &Worker::progressChanged, bar, &QSlider::setValue);
-            connect(cancelButton_, &QPushButton::clicked, &worker, &Worker::cancel);
-            worker.doWork();
+            auto worker = new Worker{};
+            connect(worker, &Worker::progressChanged, bar, &QSlider::setValue);
+            connect(cancelButton_, &QPushButton::clicked, worker, &Worker::cancel, Qt::DirectConnection); // [4]
+            connect(worker, &Worker::finished, worker, &Worker::deleteLater);
+            // [2]
+            auto thread = new QThread{};
+            worker->moveToThread(thread);
+            connect(thread, &QThread::started, worker, &Worker::doWork);
+            connect(worker, &Worker::destroyed, thread, &QThread::quit);
+            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+            thread->start(QThread::LowestPriority); // [3]
+            // [2]
+
+            // [5]
+            connect(this, &MainWindow::canceled, worker, &Worker::cancel, Qt::DirectConnection);
+            connect(thread, &QThread::finished, this, [this](){
+                threads_.removeOne(qobject_cast<QThread*>(sender()));
+                if (threads_.isEmpty()) emit runningChanged(false);
+            });
+            // [5]
         }
-        emit runningChanged(false);
     }
 private:
     QPushButton *cancelButton_;
     QList<QSlider*> bars_;
+    QList<QThread*> threads_;
 };
 
 int main(int argc, char *argv[]) {
