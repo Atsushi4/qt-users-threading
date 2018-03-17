@@ -3,8 +3,10 @@
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QPushButton>
-#include <QtConcurrent/QtConcurrentRun>
+#include <QtConcurrent/QtConcurrentMap>
 #include <QtCore/QThreadPool>
+#include <QtCore/QFutureWatcher>
+#include <QtCore/QFutureSynchronizer>
 #include "worker.h"
 
 class MainWindow : public QWidget {
@@ -24,9 +26,8 @@ public:
         buttonLayout->addWidget(cancelButton_);
         mainLayout->addLayout(buttonLayout);
         auto progressLayout = new QVBoxLayout{};
-        threadPool.setMaxThreadCount(2); // [2]
-        threadPool.setExpiryTimeout(300); // [2]
-        connect(this, &MainWindow::canceled, &threadPool, &QThreadPool::clear); // [3]
+        QThreadPool::globalInstance()->setMaxThreadCount(2);
+        QThreadPool::globalInstance()->setExpiryTimeout(300);
         for (int i = 0; i < 10; ++i) {
             auto bar = new QSlider{Qt::Horizontal};
             bar->setRange(0, 100);
@@ -47,27 +48,26 @@ public slots:
         emit runningChanged(true);
         for (int i = 0; i < 10; ++i) bars_[i]->setValue(0);
 
-        for (int i = 0; i < 10; ++i) {
-            auto bar = bars_[i];
-            bar->setValue(0);
-            // [1]
-            QtConcurrent::run(&threadPool, [](MainWindow *window, QSlider *bar){
-                Worker worker;
-                worker.connect(&worker, &Worker::progressChanged, bar, &QSlider::setValue);
-                worker.connect(window, &MainWindow::canceled, &worker, &Worker::cancel, Qt::DirectConnection);
-                worker.doWork();
-            }, this, bar);
-            // [2]
-            QtConcurrent::run([this]{
-                threadPool.waitForDone();
-                emit runningChanged(false);
-            });
-        }
+        auto watcher = new QFutureWatcher<void>{};
+        // [1]
+        connect(watcher, &QFutureWatcher<void>::finished, this, [this, watcher]{
+            watcher->deleteLater();
+            emit runningChanged(false);
+        });
+        connect(this, &MainWindow::canceled, watcher, &QFutureWatcher<void>::cancel);
+        // [1]
+        watcher->setFuture(QtConcurrent::map(bars_, [this](QSlider *bar){
+            Worker worker;
+            worker.connect(&worker, &Worker::progressChanged, bar, &QSlider::setValue);
+            worker.connect(this, &MainWindow::canceled, &worker, &Worker::cancel, Qt::DirectConnection);
+            worker.doWork();
+        }));
+        sync.addFuture(watcher->future()); // [2]
     }
 private:
     QPushButton *cancelButton_;
     QList<QSlider*> bars_;
-    QThreadPool threadPool;
+    QFutureSynchronizer<void> sync;
 };
 
 int main(int argc, char *argv[]) {
