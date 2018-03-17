@@ -3,8 +3,18 @@
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QPushButton>
-#include <QtCore/QThread> // [1]
+#include <QtCore/QThreadPool>
+#include <QtCore/QRunnable>
 #include "worker.h"
+
+template <typename ...Args>
+class NandemoRunner : public QRunnable {
+public:
+    NandemoRunner(std::function<void(Args...)> func, Args... args) : func{std::bind(func, args...)} {}
+    void run() Q_DECL_OVERRIDE {func();}
+private:
+    std::function<void()> func;
+};
 
 class MainWindow : public QWidget {
     Q_OBJECT
@@ -19,9 +29,13 @@ public:
         buttonLayout->addWidget(runButton);
         cancelButton_ = new QPushButton{QStringLiteral("&Cancel")};
         connect(this, &MainWindow::runningChanged, cancelButton_, &QPushButton::setEnabled);
+        connect(cancelButton_, &QPushButton::clicked, this, &MainWindow::canceled);
         buttonLayout->addWidget(cancelButton_);
         mainLayout->addLayout(buttonLayout);
         auto progressLayout = new QVBoxLayout{};
+        threadPool.setMaxThreadCount(2); // [2]
+        threadPool.setExpiryTimeout(300); // [2]
+        connect(this, &MainWindow::canceled, &threadPool, &QThreadPool::clear); // [3]
         for (int i = 0; i < 10; ++i) {
             auto bar = new QSlider{Qt::Horizontal};
             bar->setRange(0, 100);
@@ -31,9 +45,8 @@ public:
         mainLayout->addLayout(progressLayout);
         emit runningChanged(false);
     }
-    ~MainWindow() Q_DECL_OVERRIDE { // [6]
+    ~MainWindow() Q_DECL_OVERRIDE {
         emit canceled();
-        for (auto thread : threads_) thread->wait();
     }
 signals:
     void runningChanged(bool running);
@@ -43,35 +56,29 @@ public slots:
         emit runningChanged(true);
         for (int i = 0; i < 10; ++i) bars_[i]->setValue(0);
 
+        // [4]
         for (int i = 0; i < 10; ++i) {
             auto bar = bars_[i];
             bar->setValue(0);
-            auto worker = new Worker{};
-            connect(worker, &Worker::progressChanged, bar, &QSlider::setValue);
-            connect(cancelButton_, &QPushButton::clicked, worker, &Worker::cancel, Qt::DirectConnection); // [4]
-            connect(worker, &Worker::finished, worker, &Worker::deleteLater);
-            // [2]
-            auto thread = new QThread{};
-            worker->moveToThread(thread);
-            connect(thread, &QThread::started, worker, &Worker::doWork);
-            connect(worker, &Worker::destroyed, thread, &QThread::quit);
-            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
-            thread->start(QThread::LowestPriority); // [3]
-            // [2]
-
+            threadPool.start(new NandemoRunner<MainWindow*, QSlider*>{[](MainWindow *window, QSlider *bar){
+                Worker worker;
+                worker.connect(&worker, &Worker::progressChanged, bar, &QSlider::setValue);
+                worker.connect(window, &MainWindow::canceled, &worker, &Worker::cancel, Qt::DirectConnection);
+                worker.doWork();
+            }, this, bar}, i); // [6]
             // [5]
-            connect(this, &MainWindow::canceled, worker, &Worker::cancel, Qt::DirectConnection);
-            connect(thread, &QThread::finished, this, [this](){
-                threads_.removeOne(qobject_cast<QThread*>(sender()));
-                if (threads_.isEmpty()) emit runningChanged(false);
+            QThreadPool::globalInstance()->start(new NandemoRunner<>{[this]{
+                    threadPool.waitForDone();
+                    emit runningChanged(false);
+                }
             });
-            // [5]
         }
+        // [4]
     }
 private:
     QPushButton *cancelButton_;
     QList<QSlider*> bars_;
-    QList<QThread*> threads_;
+    QThreadPool threadPool; // [1]
 };
 
 int main(int argc, char *argv[]) {
